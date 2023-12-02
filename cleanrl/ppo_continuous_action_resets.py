@@ -13,10 +13,46 @@ import tyro
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
+# reset steps
+# reset type: full, based on norms of weights, or based on adam moments
+# reset module: none, actor, critic, both
+# reset coef: how much do we reset towards random (0 - no reset, 1 - totally random)
+
+"""
+all params:
+critic.0.weight 1 torch.Size([64, 376])
+critic.0.bias 1 torch.Size([64])
+critic.2.weight 1 torch.Size([64, 64])
+critic.2.bias 1 torch.Size([64])
+critic.4.weight 1 torch.Size([1, 64])
+critic.4.bias 1 torch.Size([1])
+actor_mean.0.weight 1 torch.Size([64, 376])
+actor_mean.0.bias 1 torch.Size([64])
+actor_mean.2.weight 1 torch.Size([64, 64])
+actor_mean.2.bias 1 torch.Size([64])
+actor_mean.4.weight 1 torch.Size([17, 64])
+actor_mean.4.bias 1 torch.Size([17])
+actor_logstd 1 torch.Size([1, 17])
+"""
+
+# can't put it args
+RESET_COEF_DICT = {"0": 0.25, "2": 0.5, "4": 1, "actor_logstd": 1}
+
 
 @dataclass
 class Args:
-    exp_name: str = os.path.basename(__file__)[: -len(".py")]
+    # reset_steps: int = 200000
+    reset_steps: int = 100000
+    # reset_steps: int = 5000
+    reset_type: str = "full"
+    reset_module: tuple = ("critic",)
+    single_reset_coef: bool = False
+    reset_coef: int = 1
+
+    exp_name: str = (
+        os.path.basename(__file__)[: -len(".py")]
+        + f"_{reset_type}_{reset_steps}_{reset_module}_{single_reset_coef}_{reset_coef}"
+    )
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
@@ -109,6 +145,19 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
+def reset_weights(param, std_coef, reset_coef):
+    with torch.no_grad():
+        param_copy = param.data.clone()
+        rand_part = torch.nn.init.orthogonal_(param_copy, std_coef)
+        param.data = reset_coef * rand_part + (1 - reset_coef) * param.data
+
+
+def reset_bias(param, reset_coef):
+    with torch.no_grad():
+        # rand_part = bias_const = 0
+        param.data = reset_coef * 0 + (1 - reset_coef) * param.data
+
+
 class Agent(nn.Module):
     def __init__(self, envs):
         super().__init__()
@@ -128,6 +177,17 @@ class Agent(nn.Module):
         )
         self.actor_logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
+        self.bias_const = 0.0
+        self.default_std = np.sqrt(2)
+        self.weight_stds = {
+            "critic.0.weight": self.default_std,
+            "critic.2.weight": self.default_std,
+            "critic.4.weight": 1.0,
+            "actor_mean.0.weight": self.default_std,
+            "actor_mean.2.weight": self.default_std,
+            "actor_mean.4.weight": 0.01,
+        }
+
     def get_value(self, x):
         return self.critic(x)
 
@@ -146,6 +206,7 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
         import wandb
@@ -180,7 +241,14 @@ if __name__ == "__main__":
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+
+    param_dict = dict(agent.named_parameters())
+    opt_params = []
+    for k, v in param_dict.items():
+        res_param = {"params": v, "name": k}
+        opt_params.append(res_param)
+
+    optimizer = optim.Adam(opt_params, lr=args.learning_rate, eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, args.num_envs) + envs.single_observation_space.shape).to(device)
@@ -196,7 +264,8 @@ if __name__ == "__main__":
     next_obs, _ = envs.reset(seed=args.seed)
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
-
+    need_reset = False
+    next_reset_step = args.reset_steps
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -208,6 +277,10 @@ if __name__ == "__main__":
             global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
+
+            if global_step >= next_reset_step and not need_reset:
+                need_reset = True
+                next_reset_step += args.reset_steps
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -303,6 +376,52 @@ if __name__ == "__main__":
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
+
+                # resets here
+
+                # adam state contains values of moments and velocities
+                # adam param_groups contains parameters (values of weights + grads)
+                # We added names to param_groups previously, and now we can use them
+                # to perform resets of particular parts of the network
+                adam_dict = optimizer.state_dict()
+                adam_state = adam_dict["state"]
+
+                if need_reset:
+                    need_reset = False
+                    print(f"performing reset ({args.reset_module})")
+                    for i, state in adam_state.items():
+                        param_group = optimizer.param_groups[i]
+                        if "name" not in param_group:
+                            print("WARNING: Adam param without name; skipping")
+                            continue
+
+                        # WARNING: it's 1-lentgh array in this particular env/model,
+                        # not sure whether that's always the case
+                        param_name = param_group["name"]
+                        param = param_group["params"][0]
+
+                        print(param_name, param.shape, state["exp_avg"].shape)
+
+                        for reset_module in args.reset_module:
+                            if param_name == "actor_logstd":
+                                reset_coef = RESET_COEF_DICT[param_name]
+                            else:
+                                layer_idx = param_name.split(".")[-2]
+                                reset_coef = RESET_COEF_DICT[layer_idx]
+
+                            if args.single_reset_coef:
+                                reset_coef = args.reset_coef
+
+                            if reset_module in param_name and "weight" in param_name:
+                                print(f"resetting {param_name} with coef {reset_coef}")
+                                std_coef = agent.weight_stds.get(param_name, agent.default_std)
+                                reset_weights(param, std_coef, reset_coef)
+                            if reset_module in param_name and "bias" in param_name:
+                                print(f"resetting {param_name} with coef {reset_coef}")
+                                reset_bias(param, reset_coef)
+                            if reset_module == "actor" and "logstd" in param_name:
+                                print(f"resetting {param_name} with coef {reset_coef}")
+                                reset_bias(param, reset_coef)
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
