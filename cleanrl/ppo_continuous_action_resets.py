@@ -36,23 +36,20 @@ actor_logstd 1 torch.Size([1, 17])
 """
 
 # can't put it args
-RESET_COEF_DICT = {"0": 0.25, "2": 0.5, "4": 1, "actor_logstd": 1}
+RESET_COEF_DICT = {
+    "critic": {"0": 0.25, "2": 0.5, "4": 1, "actor_logstd": 1},
+    "actor": {"0": 0.1, "2": 0.25, "4": 0.5, "actor_logstd": 0.5},
+}
 
 
 @dataclass
 class Args:
-    # reset_steps: int = 200000
-    reset_steps: int = 100000
+    reset_steps: int = 200000
     # reset_steps: int = 5000
     reset_type: str = "full"
     reset_module: tuple = ("critic",)
-    single_reset_coef: bool = False
-    reset_coef: int = 1
 
-    exp_name: str = (
-        os.path.basename(__file__)[: -len(".py")]
-        + f"_{reset_type}_{reset_steps}_{reset_module}_{single_reset_coef}_{reset_coef}"
-    )
+    exp_name: str = os.path.basename(__file__)[: -len(".py")] + f"_{reset_type}_{reset_steps}_{reset_module}"
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
@@ -206,6 +203,15 @@ if __name__ == "__main__":
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
+
+    reset_coef_str = "_"
+    for module, params in RESET_COEF_DICT.items():
+        if module not in args.reset_module:
+            continue
+        reset_coef_str += f"__{module}_"
+        for k, v in params.items():
+            reset_coef_str += f"{k}x{v}_"
+    args.exp_name += reset_coef_str
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
     if args.track:
@@ -404,13 +410,10 @@ if __name__ == "__main__":
 
                         for reset_module in args.reset_module:
                             if param_name == "actor_logstd":
-                                reset_coef = RESET_COEF_DICT[param_name]
+                                reset_coef = RESET_COEF_DICT["actor"][param_name]
                             else:
                                 layer_idx = param_name.split(".")[-2]
-                                reset_coef = RESET_COEF_DICT[layer_idx]
-
-                            if args.single_reset_coef:
-                                reset_coef = args.reset_coef
+                                reset_coef = RESET_COEF_DICT[reset_module][layer_idx]
 
                             if reset_module in param_name and "weight" in param_name:
                                 print(f"resetting {param_name} with coef {reset_coef}")
