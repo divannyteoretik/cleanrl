@@ -37,7 +37,7 @@ actor_logstd 1 torch.Size([1, 17])
 
 # can't put it args
 RESET_COEF_DICT = {
-    "critic": {"0": 0.25, "2": 0.5, "4": 1, "actor_logstd": 1},
+    "critic": {"0": 0.25, "2": 0.5, "4": 1},
     "actor": {"0": 0.1, "2": 0.25, "4": 0.5, "actor_logstd": 0.5},
 }
 
