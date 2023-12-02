@@ -49,7 +49,7 @@ class Args:
     reset_type: str = "full"
     reset_module: tuple = ("critic",)
 
-    exp_name: str = os.path.basename(__file__)[: -len(".py")] + f"_{reset_type}_{reset_steps}_{reset_module}"
+    exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
     seed: int = 1
     """seed of the experiment"""
@@ -204,6 +204,8 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
 
+    args.exp_name += f"_{args.reset_type}_{args.reset_steps}"
+
     reset_coef_str = "_"
     for module, params in RESET_COEF_DICT.items():
         if module not in args.reset_module:
@@ -214,6 +216,11 @@ if __name__ == "__main__":
     args.exp_name += reset_coef_str
 
     run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    print(run_name)
+    import sys
+
+    sys.exit()
+
     if args.track:
         import wandb
 
