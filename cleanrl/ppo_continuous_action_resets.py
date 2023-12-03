@@ -1,7 +1,9 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_continuous_actionpy
+import json
 import os
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -41,13 +43,17 @@ RESET_COEF_DICT = {
     "actor": {"0": 0.1, "2": 0.25, "4": 0.5, "actor_logstd": 0.5},
 }
 
+from typing import Tuple
+
 
 @dataclass
 class Args:
     reset_steps: int = 200000
     # reset_steps: int = 5000
     reset_type: str = "full"
-    reset_module: tuple = ("critic",)
+    reset_module: Tuple[str, ...] = ("critic",)
+    n_last_evals: int = 100
+    run_name: str = ""
 
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
@@ -204,8 +210,6 @@ if __name__ == "__main__":
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     args.num_iterations = args.total_timesteps // args.batch_size
 
-    args.exp_name += f"_{args.reset_type}_{args.reset_steps}"
-
     reset_coef_str = "_"
     for module, params in RESET_COEF_DICT.items():
         if module not in args.reset_module:
@@ -213,13 +217,10 @@ if __name__ == "__main__":
         reset_coef_str += f"__{module}_"
         for k, v in params.items():
             reset_coef_str += f"{k}x{v}_"
-    args.exp_name += reset_coef_str
 
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    print(run_name)
-    import sys
-
-    sys.exit()
+    run_name = args.run_name
+    if len(run_name) == 0:
+        run_name = f"{args.env_id}__{args.exp_name}_{args.reset_type}_{args.reset_steps}_{reset_coef_str}__{args.seed}__{int(time.time())}"
 
     if args.track:
         import wandb
@@ -271,6 +272,8 @@ if __name__ == "__main__":
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
+    avg_returns = deque(maxlen=args.n_last_evals)
+
     # TRY NOT TO MODIFY: start the game
     global_step = 0
     start_time = time.time()
@@ -314,6 +317,7 @@ if __name__ == "__main__":
                         print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                        avg_returns.append(info["episode"]["r"])
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -440,6 +444,23 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
+        print("writing stats to tensorboard")
+        for i, state in adam_state.items():
+            param_group = optimizer.param_groups[i]
+            if "name" not in param_group:
+                print("WARNING: Adam param without name; skipping")
+                continue
+
+            # WARNING: it's 1-lentgh array in this particular env/model,
+            # not sure whether that's always the case
+            param_name = param_group["name"]
+            param = param_group["params"][0]
+            exp_avg = state["exp_avg"]
+
+            writer.add_histogram(f"weights/{param_name}", param.data, global_step)
+            writer.add_histogram(f"grads/{param_name}", param.grad, global_step)
+            writer.add_histogram(f"exp_avgs/{param_name}", exp_avg, global_step)
+
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
@@ -480,3 +501,12 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+    last_returns = [*map(float, list(avg_returns))]
+
+    with open(f"{run_name}_res.txt", "w") as f:
+        res = np.average(last_returns)
+        res = round(res, 4)
+        f.write(str(res))
+
+    with open(f"{run_name}_res_all.txt", "w") as f:
+        json.dump(last_returns, f)
