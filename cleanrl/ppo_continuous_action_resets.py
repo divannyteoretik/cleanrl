@@ -5,6 +5,7 @@ import random
 import time
 from collections import deque
 from dataclasses import dataclass
+from typing import Tuple
 
 import gymnasium as gym
 import numpy as np
@@ -37,13 +38,19 @@ actor_mean.4.bias 1 torch.Size([17])
 actor_logstd 1 torch.Size([1, 17])
 """
 
-# can't put it args
+# can't put it in args
+
 RESET_COEF_DICT = {
     "critic": {"0": 0.25, "2": 0.5, "4": 1},
-    "actor": {"0": 0.1, "2": 0.25, "4": 0.5, "actor_logstd": 0.5},
+    "actor": {"0": 0.1, "2": 0.25, "4": 0.5, "actor_logstd": 0.0},
 }
 
-from typing import Tuple
+"""
+RESET_COEF_DICT = {
+    "critic": {"0": 0.5, "2": 0.5, "4": 1},
+    "actor": {"0": 0.0, "2": 0.0, "4": 0.5, "actor_logstd": 0.5},
+}
+"""
 
 
 @dataclass
@@ -52,6 +59,8 @@ class Args:
     # reset_steps: int = 5000
     reset_type: str = "full"
     reset_module: Tuple[str, ...] = ("critic",)
+    no_reset_bias: int = 0
+
     n_last_evals: int = 100
     run_name: str = ""
 
@@ -148,17 +157,85 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 
-def reset_weights(param, std_coef, reset_coef):
+# sort weights by abs, use reset_coef as a percentile
+# for resets
+def reset_by_abs(param, rand_part, reset_coef, mask=None):
+    if reset_coef == 1:
+        # no need for sorting
+        param.data = rand_part
+        return
+
+    if mask is None:
+        mask = param.data
+
+    # sorting by abs value
+    mask = mask.cpu().numpy().flatten().tolist()
+    mask_idxs = [*range(len(mask))]
+    mask_with_idxs = [*zip(mask, mask_idxs)]
+    if "max" in args.reset_type:
+        print("resetting max values")
+        sorted_mask_wi = sorted(mask_with_idxs, key=lambda x: np.abs(x[0]), reverse=True)
+    else:
+        sorted_mask_wi = sorted(mask_with_idxs, key=lambda x: np.abs(x[0]))
+    sorted_mask, sorted_idxs = list(zip(*sorted_mask_wi))
+
+    data_flatten = param.data.flatten()
+
+    n_weights = len(data_flatten)
+    n_reset_weights = int(n_weights * reset_coef)
+
+    reset_idxs = list(sorted_idxs[:n_reset_weights])
+    data_flatten[reset_idxs] = rand_part.flatten()[reset_idxs]
+
+
+def reset_by_val(param, rand_part, reset_coef, mask=None):
+    # sort weights, reset min and max values
+    if reset_coef == 1:
+        # no need for sorting
+        param.data = rand_part
+        return
+
+    if mask is None:
+        mask = param.data
+
+    mask_flatten = mask.flatten()
+    mask_sorted, idxs_sorted = torch.sort(mask_flatten)
+    n_weights = len(mask_flatten)
+    n_reset_weights = int(n_weights * reset_coef)
+    first_idxs = idxs_sorted[: n_reset_weights // 2]
+    last_idxs = idxs_sorted[n_reset_weights // 2 :]
+
+    data_flatten = param.data.flatten()
+    data_flatten[first_idxs] = rand_part.flatten()[first_idxs]
+    data_flatten[last_idxs] = rand_part.flatten()[last_idxs]
+
+
+def reset_weights(param, std_coef, reset_coef, exp_avg=None):
     with torch.no_grad():
         param_copy = param.data.clone()
         rand_part = torch.nn.init.orthogonal_(param_copy, std_coef)
-        param.data = reset_coef * rand_part + (1 - reset_coef) * param.data
+        print(args.reset_type)
+        if args.reset_type == "full":
+            print(f"performing full reset with coef {reset_coef}")
+            param.data = reset_coef * rand_part + (1 - reset_coef) * param.data
+        if "wnorm_abs" in args.reset_type:
+            print("using abs for resets")
+            reset_by_abs(param, rand_part, reset_coef, exp_avg)
+        if "wnorm_val" in args.reset_type:
+            print("NOT using abs for resets")
+            reset_by_val(param, rand_part, reset_coef, exp_avg)
 
 
-def reset_bias(param, reset_coef):
+def reset_bias(param, reset_coef, exp_avg=None):
     with torch.no_grad():
-        # rand_part = bias_const = 0
-        param.data = reset_coef * 0 + (1 - reset_coef) * param.data
+        rand_part = torch.zeros(param.data.shape, device=param.device)
+        if args.reset_type == "full":
+            # rand_part = bias_const = 0
+            param.data = reset_coef * 0 + (1 - reset_coef) * param.data
+        if "wnorm_abs" in args.reset_type:
+            reset_by_abs(param, rand_part, reset_coef, exp_avg)
+        if "wnorm_val" in args.reset_type:
+            reset_by_val(param, rand_part, reset_coef, exp_avg)
 
 
 class Agent(nn.Module):
@@ -220,7 +297,10 @@ if __name__ == "__main__":
 
     run_name = args.run_name
     if len(run_name) == 0:
-        run_name = f"{args.env_id}__{args.exp_name}_{args.reset_type}_{args.reset_steps}_{reset_coef_str}__{args.seed}__{int(time.time())}"
+        run_name = f"{args.env_id}__{args.exp_name}_{args.reset_type}_{args.reset_steps}_{reset_coef_str}"
+        if args.no_reset_bias:
+            run_name += "_noresetbias"
+        run_name += f"__{args.seed}__{int(time.time())}"
 
     if args.track:
         import wandb
@@ -419,6 +499,10 @@ if __name__ == "__main__":
 
                         print(param_name, param.shape, state["exp_avg"].shape)
 
+                        exp_avg = None
+                        if "expavg" in args.reset_type:
+                            exp_avg = state["exp_avg"]
+
                         for reset_module in args.reset_module:
                             if param_name == "actor_logstd":
                                 reset_coef = RESET_COEF_DICT["actor"][param_name]
@@ -429,13 +513,14 @@ if __name__ == "__main__":
                             if reset_module in param_name and "weight" in param_name:
                                 print(f"resetting {param_name} with coef {reset_coef}")
                                 std_coef = agent.weight_stds.get(param_name, agent.default_std)
-                                reset_weights(param, std_coef, reset_coef)
+                                reset_weights(param, std_coef, reset_coef, exp_avg)
                             if reset_module in param_name and "bias" in param_name:
                                 print(f"resetting {param_name} with coef {reset_coef}")
-                                reset_bias(param, reset_coef)
+                                if not args.no_reset_bias:
+                                    reset_bias(param, reset_coef, exp_avg)
                             if reset_module == "actor" and "logstd" in param_name:
                                 print(f"resetting {param_name} with coef {reset_coef}")
-                                reset_bias(param, reset_coef)
+                                reset_bias(param, reset_coef, exp_avg)
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
@@ -456,6 +541,14 @@ if __name__ == "__main__":
             param_name = param_group["name"]
             param = param_group["params"][0]
             exp_avg = state["exp_avg"]
+
+            with torch.no_grad():
+                corr_data = [param.data.flatten(), param.grad.flatten(), exp_avg.flatten()]
+                corr = torch.corrcoef(torch.stack(corr_data))
+
+            writer.add_scalar(f"correlations/{param_name}_w_grads", corr[0][1], global_step)
+            writer.add_scalar(f"correlations/{param_name}_w_expavg", corr[0][2], global_step)
+            writer.add_scalar(f"correlations/{param_name}_expavg_grads", corr[1][2], global_step)
 
             writer.add_histogram(f"weights/{param_name}", param.data, global_step)
             writer.add_histogram(f"grads/{param_name}", param.grad, global_step)
