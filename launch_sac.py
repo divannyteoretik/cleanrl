@@ -8,7 +8,7 @@ import tyro
 class Args:
     gpu: str = "V100"
     n_cpus: int = 2
-    mem: str = "4G"
+    mem: str = "6G"
     env: str = "Humanoid-v4"
     resets: bool = False
 
@@ -45,4 +45,7 @@ if __name__ == "__main__":
             "launch_sac.sbatch",
         ]
         print("will launch: ", command)
+        print(" ".join(command))
+        print()
+
         subprocess.run(command)
