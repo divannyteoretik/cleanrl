@@ -1,7 +1,10 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
+import datetime
+import json
 import os
 import random
 import time
+from collections import deque
 from dataclasses import dataclass
 
 import gymnasium as gym
@@ -14,9 +17,36 @@ import tyro
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
 
+# in "The Primacy Bias in RL", they reset actor completely when training SAC
+
+"""
+actor params:
+fc1.weight torch.Size([256, 393])
+fc1.bias torch.Size([256])
+fc2.weight torch.Size([256, 256])
+fc2.bias torch.Size([256])
+fc3.weight torch.Size([1, 256])
+fc3.bias torch.Size([1])
+"""
+
+
+def reset_actor(actor):
+    for m in actor.modules():
+        print(m)
+        if "Actor" in m.__str__():
+            continue
+        m.reset_parameters()
+
 
 @dataclass
 class Args:
+    # I don't understand the n_updates_per_train_step part
+    # https://github.com/evgenii-nikishin/rl_with_resets/blob/main/discrete_control/agents/rainbow_agent.py#L502C15-L502C94
+    n_updates_per_step: int = 1
+    n_reset_steps: int = int(1e6 + 1)
+    sps_interval: int = 10
+    n_last_evals: int = 100
+
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
     seed: int = 1
@@ -142,6 +172,9 @@ class Actor(nn.Module):
 if __name__ == "__main__":
     import stable_baselines3 as sb3
 
+    datenow = datetime.datetime.now()
+    print(f"starting at {datenow}")
+
     if sb3.__version__ < "2.0":
         raise ValueError(
             """Ongoing migration: run the following command to install the new dependencies:
@@ -150,7 +183,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
 
     args = tyro.cli(Args)
-    run_name = f"{args.env_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
+    n_reset_steps_runname = args.n_reset_steps
+    if args.n_reset_steps > args.total_timesteps:
+        n_reset_steps_runname = "noresets"
+    run_name = f"{args.env_id}__{args.exp_name}_{n_reset_steps_runname}__{args.seed}__{int(time.time())}"
+    print(run_name)
     if args.track:
         import wandb
 
@@ -190,8 +227,28 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
-    q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
-    actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+
+    q_params = []
+    qf1_dict = dict(qf1.named_parameters())
+    for k, v in qf1_dict.items():
+        res_param = {"params": v, "name": f"qf1_{k}"}
+        q_params.append(res_param)
+    qf2_dict = dict(qf2.named_parameters())
+    for k, v in qf2_dict.items():
+        res_param = {"params": v, "name": f"qf2_{k}"}
+        q_params.append(res_param)
+
+    actor_params = []
+    actor_dict = dict(actor.named_parameters())
+    for k, v in qf2_dict.items():
+        print(k, v.data.shape)
+        res_param = {"params": v, "name": f"actor_{k}"}
+        actor_params.append(res_param)
+
+    # q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
+    # actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
+    q_optimizer = optim.Adam(q_params, lr=args.q_lr)
+    actor_optimizer = optim.Adam(actor_params, lr=args.policy_lr)
 
     # Automatic entropy tuning
     if args.autotune:
@@ -214,6 +271,13 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
+
+    sps = 0
+    last_sps_measuring_time = time.time()
+    last_sps_step = 0
+
+    avg_returns = deque(maxlen=args.n_last_evals)
+
     for global_step in range(args.total_timesteps):
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
@@ -228,9 +292,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # TRY NOT TO MODIFY: record rewards for plotting purposes
         if "final_info" in infos:
             for info in infos["final_info"]:
-                print(f"global_step={global_step}, episodic_return={info['episode']['r']}")
+                datenow = datetime.datetime.now()
+                print(f"{datenow} global_step={global_step}, episodic_return={info['episode']['r']}")
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
+                avg_returns.append(info["episode"]["r"])
                 break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
@@ -244,7 +310,13 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         obs = next_obs
 
         # ALGO LOGIC: training.
-        if global_step > args.learning_starts:
+        # if global_step > args.learning_starts:
+        if global_step % args.n_reset_steps == 0:
+            reset_actor(actor)
+
+        if global_step <= args.learning_starts:
+            continue
+        for _ in range(args.n_updates_per_step):
             data = rb.sample(args.batch_size)
             with torch.no_grad():
                 next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
@@ -295,18 +367,79 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 for param, target_param in zip(qf2.parameters(), qf2_target.parameters()):
                     target_param.data.copy_(args.tau * param.data + (1 - args.tau) * target_param.data)
 
-            if global_step % 100 == 0:
-                writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
-                writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
-                writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
-                writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
-                writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
-                writer.add_scalar("losses/alpha", alpha, global_step)
-                print("SPS:", int(global_step / (time.time() - start_time)))
-                writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-                if args.autotune:
-                    writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+        if time.time() - last_sps_measuring_time > args.sps_interval:
+            n_steps = global_step - last_sps_step
+            sps = round(n_steps / args.sps_interval, 4)
+            last_sps_step = global_step
+            last_sps_measuring_time = time.time()
+
+        if global_step % 100 == 0:
+
+            writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
+            writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
+            writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
+            writer.add_scalar("losses/qf2_loss", qf2_loss.item(), global_step)
+            writer.add_scalar("losses/qf_loss", qf_loss.item() / 2.0, global_step)
+            writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
+            writer.add_scalar("losses/alpha", alpha, global_step)
+            # print("SPS:", int(global_step / (time.time() - start_time)))
+            print("SPS:", sps)
+            writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+            if args.autotune:
+                writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
+
+            if global_step % 2000 != 0:
+                continue
+
+            def add_param_group_info(param_group, state):
+                param_name = param_group["name"]
+                param = param_group["params"][0]
+                exp_avg = state["exp_avg"]
+
+                try:
+                    with torch.no_grad():
+                        corr_data = [param.data.flatten(), param.grad.flatten(), exp_avg.flatten()]
+                        corr = torch.corrcoef(torch.stack(corr_data))
+                except:
+                    print("can't compute corr")
+
+                try:
+                    writer.add_scalar(f"corr/{param_name}_w_grads", corr[0][1], global_step)
+                    writer.add_scalar(f"corr/{param_name}_w_expavg", corr[0][2], global_step)
+                    writer.add_scalar(f"corr/{param_name}_expavg_grads", corr[1][2], global_step)
+                    writer.add_histogram(f"wts/{param_name}", param.data, global_step)
+                    writer.add_histogram(f"grad/{param_name}", param.grad, global_step)
+                    writer.add_histogram(f"eavg/{param_name}", exp_avg, global_step)
+                except:
+                    print("can't add histogram, probably after weight resets")
+
+            actor_opt_state = actor_optimizer.state_dict()["state"]
+            for i, state in actor_opt_state.items():
+                param_group = actor_optimizer.param_groups[i]
+                if "name" not in param_group:
+                    print("WARNING: Adam param without name; skipping")
+                    continue
+
+                add_param_group_info(param_group, state)
+
+            q_opt_state = q_optimizer.state_dict()["state"]
+            for i, state in q_opt_state.items():
+                param_group = q_optimizer.param_groups[i]
+                if "name" not in param_group:
+                    print("WARNING: Adam param without name; skipping")
+                    continue
+
+                add_param_group_info(param_group, state)
+
+    last_returns = [*map(float, list(avg_returns))]
 
     envs.close()
     writer.close()
+
+    with open(f"{run_name}_res.txt", "w") as f:
+        res = np.average(last_returns)
+        res = round(res, 4)
+        f.write(str(res))
+
+    with open(f"{run_name}_res_all.json", "w") as f:
+        json.dump(last_returns, f)
