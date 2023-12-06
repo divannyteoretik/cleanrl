@@ -1,6 +1,7 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/sac/#sac_continuous_actionpy
 import datetime
 import json
+import math
 import os
 import random
 import time
@@ -21,13 +22,24 @@ from torch.utils.tensorboard import SummaryWriter
 
 """
 actor params:
-fc1.weight torch.Size([256, 393])
+fc1.weight torch.Size([256, 27])
 fc1.bias torch.Size([256])
 fc2.weight torch.Size([256, 256])
 fc2.bias torch.Size([256])
-fc3.weight torch.Size([1, 256])
-fc3.bias torch.Size([1])
+fc_mean.weight torch.Size([8, 256])
+fc_mean.bias torch.Size([8])
+fc_logstd.weight torch.Size([8, 256])
+fc_logstd.bias torch.Size([8])
 """
+
+
+RESET_COEF_DICT = {
+    "actor": {"fc1": 0.5, "fc2": 0.5, "fc_mean": 1, "fc_logstd": 1},
+}
+
+RESET_COEF_DICT = {
+    "actor": {"fc1": 1, "fc2": 1, "fc_mean": 1, "fc_logstd": 1},
+}
 
 
 def reset_actor(actor):
@@ -38,6 +50,92 @@ def reset_actor(actor):
         m.reset_parameters()
 
 
+# sort weights by abs, use reset_coef as a percentile
+# for resets
+def reset_by_abs(param, rand_part, reset_coef, mask=None):
+    if reset_coef == 1:
+        # no need for sorting
+        param.data = rand_part
+        return
+
+    if mask is None:
+        mask = param.data
+
+    # sorting by abs value
+    mask = mask.cpu().numpy().flatten().tolist()
+    mask_idxs = [*range(len(mask))]
+    mask_with_idxs = [*zip(mask, mask_idxs)]
+    if "max" in args.reset_type:
+        print("resetting max values")
+        sorted_mask_wi = sorted(mask_with_idxs, key=lambda x: np.abs(x[0]), reverse=True)
+    else:
+        sorted_mask_wi = sorted(mask_with_idxs, key=lambda x: np.abs(x[0]))
+    sorted_mask, sorted_idxs = list(zip(*sorted_mask_wi))
+
+    data_flatten = param.data.flatten()
+
+    n_weights = len(data_flatten)
+    n_reset_weights = int(n_weights * reset_coef)
+
+    reset_idxs = list(sorted_idxs[:n_reset_weights])
+    data_flatten[reset_idxs] = rand_part.flatten()[reset_idxs]
+
+
+def reset_by_val(param, rand_part, reset_coef, mask=None):
+    # sort weights, reset min and max values
+    if reset_coef == 1:
+        # no need for sorting
+        param.data = rand_part
+        return
+
+    if mask is None:
+        mask = param.data
+
+    mask_flatten = mask.flatten()
+    mask_sorted, idxs_sorted = torch.sort(mask_flatten)
+    n_weights = len(mask_flatten)
+    n_reset_weights = int(n_weights * reset_coef)
+    first_idxs = idxs_sorted[: n_reset_weights // 2]
+    last_idxs = idxs_sorted[n_reset_weights // 2 :]
+
+    data_flatten = param.data.flatten()
+    data_flatten[first_idxs] = rand_part.flatten()[first_idxs]
+    data_flatten[last_idxs] = rand_part.flatten()[last_idxs]
+
+
+# https://github.com/pytorch/pytorch/blob/main/torch/nn/modules/linear.py#L105
+def reset_weights(param, reset_coef, exp_avg=None):
+    print("resetting weights")
+    with torch.no_grad():
+        param_copy = param.data.clone()
+        rand_part = torch.nn.init.kaiming_uniform_(param_copy, a=math.sqrt(5))
+        print(args.reset_type)
+        if args.reset_type == "full":
+            print(f"performing full reset with coef {reset_coef}")
+            param.data = reset_coef * rand_part + (1 - reset_coef) * param.data
+        elif "wnorm_abs" in args.reset_type:
+            print("using abs for resets")
+            reset_by_abs(param, rand_part, reset_coef, exp_avg)
+        elif "wnorm_val" in args.reset_type:
+            print("NOT using abs for resets")
+            reset_by_val(param, rand_part, reset_coef, exp_avg)
+        else:
+            print(args.reset_type)
+
+
+def reset_bias(param, bound, reset_coef, exp_avg=None):
+    with torch.no_grad():
+        param_copy = param.data.clone()
+        rand_part = nn.init.uniform_(param_copy, -bound, bound)
+        if args.reset_type == "full":
+            # rand_part = bias_const = 0
+            param.data = reset_coef * rand_part + (1 - reset_coef) * param.data
+        if "wnorm_abs" in args.reset_type:
+            reset_by_abs(param, rand_part, reset_coef, exp_avg)
+        if "wnorm_val" in args.reset_type:
+            reset_by_val(param, rand_part, reset_coef, exp_avg)
+
+
 @dataclass
 class Args:
     # I don't understand the n_updates_per_train_step part
@@ -46,6 +144,9 @@ class Args:
     n_reset_steps: int = int(1e6 + 1)
     sps_interval: int = 10
     n_last_evals: int = 100
+    run_name: str = ""
+    reset_type: str = "full"
+    no_reset_bias: int = 0
 
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
@@ -144,6 +245,15 @@ class Actor(nn.Module):
             "action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32)
         )
 
+    def set_bias_bounds(self):
+        self.bias_bounds = {}
+        for mname, m in self.named_modules():
+            if len(mname) == 0:
+                continue
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            self.bias_bounds[mname] = bound
+
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
@@ -186,7 +296,12 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     n_reset_steps_runname = args.n_reset_steps
     if args.n_reset_steps > args.total_timesteps:
         n_reset_steps_runname = "noresets"
-    run_name = f"{args.env_id}__{args.exp_name}_{n_reset_steps_runname}__{args.seed}__{int(time.time())}"
+
+    run_name = args.run_name
+    if len(run_name) == 0:
+        run_name = (
+            f"{args.env_id}__{args.exp_name}_{args.total_timesteps}_{n_reset_steps_runname}__{args.seed}__{int(time.time())}"
+        )
     print(run_name)
     if args.track:
         import wandb
@@ -221,6 +336,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs).to(device)
+    actor.set_bias_bounds()
+
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
     qf1_target = SoftQNetwork(envs).to(device)
@@ -240,7 +357,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     actor_params = []
     actor_dict = dict(actor.named_parameters())
-    for k, v in qf2_dict.items():
+    for k, v in actor_dict.items():
         print(k, v.data.shape)
         res_param = {"params": v, "name": f"actor_{k}"}
         actor_params.append(res_param)
@@ -312,7 +429,41 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: training.
         # if global_step > args.learning_starts:
         if global_step % args.n_reset_steps == 0:
-            reset_actor(actor)
+            # reset_actor(actor) # works, but not flexible
+
+            actor_opt_state = actor_optimizer.state_dict()["state"]
+
+            for i, state in actor_opt_state.items():
+                param_group = actor_optimizer.param_groups[i]
+                if "name" not in param_group:
+                    print("WARNING: Adam param without name; skipping")
+                    continue
+
+                # WARNING: it's 1-lentgh array in this particular env/model,
+                # not sure whether that's always the case
+                param_name = param_group["name"]
+                layer_name = param_name.replace("actor_", "").split(".")[0]
+
+                param = param_group["params"][0]
+
+                print(param_name, param.shape, state["exp_avg"].shape)
+
+                exp_avg = None
+
+                if "expavg" in args.reset_type:
+                    exp_avg = state["exp_avg"]
+
+                reset_coef = RESET_COEF_DICT["actor"][layer_name]
+                # reset_coef = 1
+                if "weight" in param_name:
+                    print(f"resetting {param_name} with coef {reset_coef}")
+                    reset_weights(param, reset_coef, exp_avg)
+                if "bias" in param_name:
+                    print(f"resetting {param_name} with coef {reset_coef}")
+                    print(actor.bias_bounds)
+                    bound = actor.bias_bounds[layer_name]
+                    if not args.no_reset_bias:
+                        reset_bias(param, bound, reset_coef, exp_avg)
 
         if global_step <= args.learning_starts:
             continue
@@ -374,7 +525,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             last_sps_measuring_time = time.time()
 
         if global_step % 100 == 0:
-
+            print(f"{datenow} global_step={global_step}")
             writer.add_scalar("losses/qf1_values", qf1_a_values.mean().item(), global_step)
             writer.add_scalar("losses/qf2_values", qf2_a_values.mean().item(), global_step)
             writer.add_scalar("losses/qf1_loss", qf1_loss.item(), global_step)
@@ -388,14 +539,14 @@ poetry run pip install "stable_baselines3==2.0.0a1"
             if args.autotune:
                 writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
 
-            if global_step % 2000 != 0:
+            if global_step % 1000 != 0:
                 continue
 
             def add_param_group_info(param_group, state):
                 param_name = param_group["name"]
                 param = param_group["params"][0]
                 exp_avg = state["exp_avg"]
-
+                print("adding histograms")
                 try:
                     with torch.no_grad():
                         corr_data = [param.data.flatten(), param.grad.flatten(), exp_avg.flatten()]

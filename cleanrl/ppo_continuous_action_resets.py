@@ -55,7 +55,7 @@ RESET_COEF_DICT = {
 
 @dataclass
 class Args:
-    reset_steps: int = 200000
+    n_reset_steps: int = 200000
     # reset_steps: int = 5000
     reset_type: str = "full"
     reset_module: Tuple[str, ...] = ("critic",)
@@ -297,11 +297,14 @@ if __name__ == "__main__":
 
     run_name = args.run_name
     if len(run_name) == 0:
-        run_name = f"{args.env_id}__{args.exp_name}_{args.reset_type}_{args.reset_steps}_{reset_coef_str}"
+        run_name = (
+            f"{args.env_id}__{args.exp_name}_{args.total_timesteps}_{args.reset_type}_{args.n_reset_steps}_{reset_coef_str}"
+        )
         if args.no_reset_bias:
             run_name += "_noresetbias"
         run_name += f"__{args.seed}__{int(time.time())}"
 
+    print(run_name)
     if args.track:
         import wandb
 
@@ -361,7 +364,7 @@ if __name__ == "__main__":
     next_obs = torch.Tensor(next_obs).to(device)
     next_done = torch.zeros(args.num_envs).to(device)
     need_reset = False
-    next_reset_step = args.reset_steps
+    next_reset_step = args.n_reset_steps
     for iteration in range(1, args.num_iterations + 1):
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
@@ -376,7 +379,7 @@ if __name__ == "__main__":
 
             if global_step >= next_reset_step and not need_reset:
                 need_reset = True
-                next_reset_step += args.reset_steps
+                next_reset_step += args.n_reset_steps
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
