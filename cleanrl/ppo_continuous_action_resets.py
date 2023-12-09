@@ -60,6 +60,8 @@ class Args:
     reset_type: str = "full"
     reset_module: Tuple[str, ...] = ("critic",)
     no_reset_bias: int = 0
+    heavy_priming_iters: int = 0
+    avg_return_history_step: int = 1000
 
     n_last_evals: int = 100
     run_name: str = ""
@@ -295,16 +297,21 @@ if __name__ == "__main__":
         for k, v in params.items():
             reset_coef_str += f"{k}x{v}_"
 
+    reset_str = f"{args.n_reset_steps}_{args.reset_type}_{reset_coef_str}"
+    if args.no_reset_bias:
+        reset_str += "_noresetbias"
+
+    if args.n_reset_steps >= args.total_timesteps:
+        reset_str = "noresets"
+
+    args.reset_str = reset_str
+
     run_name = args.run_name
     if len(run_name) == 0:
-        run_name = (
-            f"{args.env_id}__{args.exp_name}_{args.total_timesteps}_{args.reset_type}_{args.n_reset_steps}_{reset_coef_str}"
-        )
-        if args.no_reset_bias:
-            run_name += "_noresetbias"
+        run_name = f"{args.env_id}__{args.exp_name}_{args.total_timesteps}_r{reset_str}"
         run_name += f"__{args.seed}__{int(time.time())}"
-
     print(run_name)
+
     if args.track:
         import wandb
 
@@ -356,6 +363,9 @@ if __name__ == "__main__":
     values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
     avg_returns = deque(maxlen=args.n_last_evals)
+    avg_return_history = {}
+    need_add_avg_return = False
+    next_avg_return_history_step = 0
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -381,6 +391,10 @@ if __name__ == "__main__":
                 need_reset = True
                 next_reset_step += args.n_reset_steps
 
+            if global_step >= next_avg_return_history_step and not need_add_avg_return:
+                need_add_avg_return = True
+                next_avg_return_history_step += args.avg_return_history_step
+
             # ALGO LOGIC: action logic
             with torch.no_grad():
                 action, logprob, _, value = agent.get_action_and_value(next_obs)
@@ -401,6 +415,11 @@ if __name__ == "__main__":
                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                         writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                         avg_returns.append(info["episode"]["r"])
+                        if need_add_avg_return:
+                            avg_ret = round(np.average(avg_returns), 4)
+                            print(f"adding average return: step {global_step} return: {avg_ret}")
+                            avg_return_history[global_step] = avg_ret
+                            need_add_avg_return = False
 
         # bootstrap value if not done
         with torch.no_grad():
@@ -429,11 +448,27 @@ if __name__ == "__main__":
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
+
+        heavy_priming = args.heavy_priming_iters > 0 and iteration == 1
+
+        n_updates = args.update_epochs
+        if heavy_priming:
+            n_updates = 1e5
+
         for epoch in range(args.update_epochs):
             np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
+            batch_size = args.batch_size
+            minibatch_size = args.minibatch_size
+            if heavy_priming:
+                batch_size = 100
+                if minibatch_size >= batch_size:
+                    minibatch_size = batch_size - 1
+
+            for start in range(0, batch_size, minibatch_size):
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
+                if heavy_priming and epoch % 100 == 0:
+                    print(f"heavy priming; epoch {epoch}; minibatch_size: {len(mb_inds)}")
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(b_obs[mb_inds], b_actions[mb_inds])
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -472,6 +507,8 @@ if __name__ == "__main__":
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
+                # We loose one update step because of resets right after it
+                # maybe it's better to move this code after the resets
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
@@ -604,5 +641,9 @@ if __name__ == "__main__":
         res = round(res, 4)
         f.write(str(res))
 
-    with open(f"{run_name}_res_all.txt", "w") as f:
+    with open(f"{run_name}_res_all.json", "w") as f:
         json.dump(last_returns, f)
+
+    with open(f"{run_name}_avg_return_history.json", "w") as f:
+        hist = {k: float(v) for k, v in avg_return_history.items()}
+        json.dump(hist, f)

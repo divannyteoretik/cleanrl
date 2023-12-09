@@ -147,6 +147,11 @@ class Args:
     run_name: str = ""
     reset_type: str = "full"
     no_reset_bias: int = 0
+    avg_return_history_step: int = 1000
+    heavy_priming_iters: int = 0
+    # optimize_actor_on_priming = False
+    optimize_actor_on_priming = True
+    optimize_q_on_priming = False
 
     exp_name: str = os.path.basename(__file__)[: -len(".py")]
     """the name of this experiment"""
@@ -293,16 +298,19 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         )
 
     args = tyro.cli(Args)
-    n_reset_steps_runname = args.n_reset_steps
-    if args.n_reset_steps > args.total_timesteps:
-        n_reset_steps_runname = "noresets"
+
+    reset_str = f"{args.n_reset_steps}"
+    if args.n_reset_steps >= args.total_timesteps:
+        reset_str = "noresets"
+
+    args.reset_str = reset_str
 
     run_name = args.run_name
     if len(run_name) == 0:
-        run_name = (
-            f"{args.env_id}__{args.exp_name}_{args.total_timesteps}_{n_reset_steps_runname}__{args.seed}__{int(time.time())}"
-        )
+        run_name = f"{args.env_id}__{args.exp_name}_{args.total_timesteps}_r{reset_str}"
+        run_name += "__{args.seed}__{int(time.time())}"
     print(run_name)
+
     if args.track:
         import wandb
 
@@ -394,8 +402,21 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     last_sps_step = 0
 
     avg_returns = deque(maxlen=args.n_last_evals)
+    avg_return_history = {}
+    need_add_avg_return = False
+    next_avg_return_history_step = 0
 
-    for global_step in range(args.total_timesteps):
+    is_first_learning_step = True
+    for global_step in range(args.total_timesteps + 1):
+        # print(f"GLOBAL STEP: {global_step}; {args.heavy_priming_iters} {args.learning_starts}")
+
+        if global_step >= next_avg_return_history_step and not need_add_avg_return:
+            need_add_avg_return = True
+            next_avg_return_history_step += args.avg_return_history_step
+
+        if args.heavy_priming_iters > 0 and is_first_learning_step:
+            args.learning_starts = args.batch_size
+
         # ALGO LOGIC: put action logic here
         if global_step < args.learning_starts:
             actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
@@ -414,6 +435,11 @@ poetry run pip install "stable_baselines3==2.0.0a1"
                 writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
                 writer.add_scalar("charts/episodic_length", info["episode"]["l"], global_step)
                 avg_returns.append(info["episode"]["r"])
+                if need_add_avg_return:
+                    avg_ret = round(np.average(avg_returns), 4)
+                    print(f"adding average return: step {global_step} return: {avg_ret}")
+                    avg_return_history[global_step] = avg_ret
+                    need_add_avg_return = False
                 break
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
@@ -467,30 +493,53 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
         if global_step <= args.learning_starts:
             continue
-        for _ in range(args.n_updates_per_step):
+
+        n_updates_per_step = args.n_updates_per_step
+        is_heavy_priming_step = args.heavy_priming_iters > 0 and is_first_learning_step
+        if is_heavy_priming_step:
+            n_updates_per_step = args.heavy_priming_iters
+            is_first_learning_step = False
+
+        for cur_update_step in range(n_updates_per_step):
             data = rb.sample(args.batch_size)
-            with torch.no_grad():
-                next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
-                qf1_next_target = qf1_target(data.next_observations, next_state_actions)
-                qf2_next_target = qf2_target(data.next_observations, next_state_actions)
-                min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
-                next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (min_qf_next_target).view(-1)
+            if is_heavy_priming_step and cur_update_step % 100 == 0:
+                print(f"heavy priming; epoch {cur_update_step}; batch_size: {len(data.dones.flatten())}")
 
-            qf1_a_values = qf1(data.observations, data.actions).view(-1)
-            qf2_a_values = qf2(data.observations, data.actions).view(-1)
-            qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
-            qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
-            qf_loss = qf1_loss + qf2_loss
+            optimize_q_on_priming = is_heavy_priming_step and args.optimize_q_on_priming
+            optimize_q = optimize_q_on_priming or (not is_heavy_priming_step)
+            if optimize_q:
+                # print("optimizing q")
+                with torch.no_grad():
+                    next_state_actions, next_state_log_pi, _ = actor.get_action(data.next_observations)
+                    qf1_next_target = qf1_target(data.next_observations, next_state_actions)
+                    qf2_next_target = qf2_target(data.next_observations, next_state_actions)
+                    min_qf_next_target = torch.min(qf1_next_target, qf2_next_target) - alpha * next_state_log_pi
+                    next_q_value = data.rewards.flatten() + (1 - data.dones.flatten()) * args.gamma * (
+                        min_qf_next_target
+                    ).view(-1)
 
-            # optimize the model
-            q_optimizer.zero_grad()
-            qf_loss.backward()
-            q_optimizer.step()
+                qf1_a_values = qf1(data.observations, data.actions).view(-1)
+                qf2_a_values = qf2(data.observations, data.actions).view(-1)
+                qf1_loss = F.mse_loss(qf1_a_values, next_q_value)
+                qf2_loss = F.mse_loss(qf2_a_values, next_q_value)
+                qf_loss = qf1_loss + qf2_loss
 
-            if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
+                # optimize the model
+                q_optimizer.zero_grad()
+                qf_loss.backward()
+                q_optimizer.step()
+
+            optimize_actor_on_priming = cur_update_step % args.policy_frequency == 0
+            optimize_actor_on_priming = optimize_actor_on_priming and is_heavy_priming_step
+            optimize_actor_on_priming = optimize_actor_on_priming and args.optimize_actor_on_priming
+
+            optimize_actor = global_step % args.policy_frequency and not is_heavy_priming_step
+            optimize_actor = optimize_actor or optimize_actor_on_priming
+            if optimize_actor:
                 for _ in range(
                     args.policy_frequency
                 ):  # compensate for the delay by doing 'actor_update_interval' instead of 1
+                    # print("optimizing actor")
                     pi, log_pi, _ = actor.get_action(data.observations)
                     qf1_pi = qf1(data.observations, pi)
                     qf2_pi = qf2(data.observations, pi)
@@ -594,3 +643,7 @@ poetry run pip install "stable_baselines3==2.0.0a1"
 
     with open(f"{run_name}_res_all.json", "w") as f:
         json.dump(last_returns, f)
+
+    with open(f"{run_name}_avg_return_history.json", "w") as f:
+        hist = {k: float(v) for k, v in avg_return_history.items()}
+        json.dump(hist, f)
