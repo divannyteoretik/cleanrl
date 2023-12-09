@@ -453,19 +453,21 @@ if __name__ == "__main__":
 
         n_updates = args.update_epochs
         if heavy_priming:
-            n_updates = 1e5
+            n_updates = args.heavy_priming_iters
 
-        for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
+        for epoch in range(n_updates):
+            if not heavy_priming:
+                np.random.shuffle(b_inds)
+
             batch_size = args.batch_size
             minibatch_size = args.minibatch_size
             if heavy_priming:
                 batch_size = 100
                 if minibatch_size >= batch_size:
-                    minibatch_size = batch_size - 1
+                    minibatch_size = batch_size
 
             for start in range(0, batch_size, minibatch_size):
-                end = start + args.minibatch_size
+                end = start + minibatch_size
                 mb_inds = b_inds[start:end]
                 if heavy_priming and epoch % 100 == 0:
                     print(f"heavy priming; epoch {epoch}; minibatch_size: {len(mb_inds)}")
