@@ -308,7 +308,8 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     run_name = args.run_name
     if len(run_name) == 0:
         run_name = f"{args.env_id}__{args.exp_name}_{args.total_timesteps}_r{reset_str}"
-        run_name += "__{args.seed}__{int(time.time())}"
+        run_name += f"_rr{args.n_updates_per_step}"
+        run_name += f"__{args.seed}__{int(time.time())}"
     print(run_name)
 
     if args.track:
