@@ -21,6 +21,14 @@ from torch.utils.tensorboard import SummaryWriter
 # in "The Primacy Bias in RL", they reset actor completely when training SAC
 
 """
+critic params:
+fc1.weight torch.Size([256, 14])
+fc1.bias torch.Size([256])
+fc2.weight torch.Size([256, 256])
+fc2.bias torch.Size([256])
+fc3.weight torch.Size([1, 256])
+fc3.bias torch.Size([1])
+
 actor params:
 fc1.weight torch.Size([256, 27])
 fc1.bias torch.Size([256])
@@ -33,21 +41,39 @@ fc_logstd.bias torch.Size([8])
 """
 
 
-RESET_COEF_DICT = {
-    "actor": {"fc1": 0.5, "fc2": 0.5, "fc_mean": 1, "fc_logstd": 1},
+CRITIC_RESET_COEF_DICT = {
+    "fc1": 0.5,
+    "fc2": 0.5,
+    "fc3": 1,
 }
 
-RESET_COEF_DICT = {
-    "actor": {"fc1": 1, "fc2": 1, "fc_mean": 1, "fc_logstd": 1},
+ACTOR_RESET_COEF_DICT = {
+    "fc1": 0.5,
+    "fc2": 0.5,
+    "fc_mean": 1,
+    "fc_logstd": 1,
 }
 
+RESET_COEF_DICT = {}
+for k, v in CRITIC_RESET_COEF_DICT.items():
+    RESET_COEF_DICT[f"qf1_{k}.weight"] = v
+    RESET_COEF_DICT[f"qf1_{k}.bias"] = v
 
-def reset_actor(actor):
-    for m in actor.modules():
-        print(m)
-        if "Actor" in m.__str__():
-            continue
-        m.reset_parameters()
+    RESET_COEF_DICT[f"qf2_{k}.weight"] = v
+    RESET_COEF_DICT[f"qf2_{k}.bias"] = v
+
+for k, v in ACTOR_RESET_COEF_DICT.items():
+    RESET_COEF_DICT[f"actor_{k}.weight"] = v
+    RESET_COEF_DICT[f"actor_{k}.bias"] = v
+
+# https://github.com/pytorch/pytorch/blob/main/torch/nn/modules/linear.py#L110
+BIAS_BOUND_DICT = {}
+
+
+def get_bias_bound(weight):
+    fan_in, _ = nn.init._calculate_fan_in_and_fan_out(weight)
+    bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+    return bound
 
 
 # sort weights by abs, use reset_coef as a percentile
@@ -140,7 +166,6 @@ def reset_bias(param, bound, reset_coef, exp_avg=None):
 class Args:
     # I don't understand the n_updates_per_train_step part
     # https://github.com/evgenii-nikishin/rl_with_resets/blob/main/discrete_control/agents/rainbow_agent.py#L502C15-L502C94
-    n_updates_per_step: int = 1
     n_reset_steps: int = int(1e6 + 1)
     sps_interval: int = 10
     n_last_evals: int = 100
@@ -235,6 +260,15 @@ LOG_STD_MAX = 2
 LOG_STD_MIN = -5
 
 
+def set_bias_bounds(module, module_name):
+    for mname, m in module.named_modules():
+        if len(mname) == 0:
+            continue
+        fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
+        1 / math.sqrt(fan_in) if fan_in > 0 else 0
+        BIAS_BOUNDS_DICT[module_name][mname] = bias_
+
+
 class Actor(nn.Module):
     def __init__(self, env):
         super().__init__()
@@ -249,15 +283,6 @@ class Actor(nn.Module):
         self.register_buffer(
             "action_bias", torch.tensor((env.action_space.high + env.action_space.low) / 2.0, dtype=torch.float32)
         )
-
-    def set_bias_bounds(self):
-        self.bias_bounds = {}
-        for mname, m in self.named_modules():
-            if len(mname) == 0:
-                continue
-            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(m.weight)
-            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
-            self.bias_bounds[mname] = bound
 
     def forward(self, x):
         x = F.relu(self.fc1(x))
@@ -345,31 +370,34 @@ poetry run pip install "stable_baselines3==2.0.0a1"
     max_action = float(envs.single_action_space.high[0])
 
     actor = Actor(envs).to(device)
-    actor.set_bias_bounds()
 
     qf1 = SoftQNetwork(envs).to(device)
     qf2 = SoftQNetwork(envs).to(device)
+
     qf1_target = SoftQNetwork(envs).to(device)
     qf2_target = SoftQNetwork(envs).to(device)
     qf1_target.load_state_dict(qf1.state_dict())
     qf2_target.load_state_dict(qf2.state_dict())
 
-    q_params = []
-    qf1_dict = dict(qf1.named_parameters())
-    for k, v in qf1_dict.items():
-        res_param = {"params": v, "name": f"qf1_{k}"}
-        q_params.append(res_param)
-    qf2_dict = dict(qf2.named_parameters())
-    for k, v in qf2_dict.items():
-        res_param = {"params": v, "name": f"qf2_{k}"}
-        q_params.append(res_param)
+    def handle_params(module, module_name):
+        module_params = []
+        module_dict = dict(module.named_parameters())
+        for k, v in module_dict.items():
+            res_name = f"{module_name}_{k}"
+            res_param = {"params": v, "name": res_name}
+            if "weight" in res_name:
+                bias_bound = get_bias_bound(v)
+                bias_name = res_name.replace("weight", "bias")
+                BIAS_BOUND_DICT[bias_name] = bias_bound
+            module_params.append(res_param)
+        return module_params
 
-    actor_params = []
-    actor_dict = dict(actor.named_parameters())
-    for k, v in actor_dict.items():
-        print(k, v.data.shape)
-        res_param = {"params": v, "name": f"actor_{k}"}
-        actor_params.append(res_param)
+    qf1_params = handle_params(qf1, "qf1")
+    qf2_params = handle_params(qf2, "qf2")
+    actor_params = handle_params(actor, "actor")
+
+    q_params = qf1_params + qf2_params
+    print(BIAS_BOUND_DICT)
 
     # q_optimizer = optim.Adam(list(qf1.parameters()) + list(qf2.parameters()), lr=args.q_lr)
     # actor_optimizer = optim.Adam(list(actor.parameters()), lr=args.policy_lr)
@@ -456,41 +484,42 @@ poetry run pip install "stable_baselines3==2.0.0a1"
         # ALGO LOGIC: training.
         # if global_step > args.learning_starts:
         if global_step % args.n_reset_steps == 0:
+            # reset_module(qf1)
+            # reset_module(qf2)
             # reset_actor(actor) # works, but not flexible
 
-            actor_opt_state = actor_optimizer.state_dict()["state"]
+            def reset(optimizer):
+                opt_state = optimizer.state_dict()["state"]
+                for i, state in opt_state.items():
+                    param_group = optimizer.param_groups[i]
+                    if "name" not in param_group:
+                        print("WARNING: Adam param without name; skipping")
+                        continue
 
-            for i, state in actor_opt_state.items():
-                param_group = actor_optimizer.param_groups[i]
-                if "name" not in param_group:
-                    print("WARNING: Adam param without name; skipping")
-                    continue
+                    # WARNING: it's 1-lentgh array in this particular env/model,
+                    # not sure whether that's always the case
+                    param = param_group["params"][0]
+                    param_name = param_group["name"]
 
-                # WARNING: it's 1-lentgh array in this particular env/model,
-                # not sure whether that's always the case
-                param_name = param_group["name"]
-                layer_name = param_name.replace("actor_", "").split(".")[0]
+                    print(param_name, param.shape, state["exp_avg"].shape)
 
-                param = param_group["params"][0]
+                    exp_avg = None
+                    if "expavg" in args.reset_type:
+                        exp_avg = state["exp_avg"]
 
-                print(param_name, param.shape, state["exp_avg"].shape)
+                    reset_coef = RESET_COEF_DICT[param_name]
 
-                exp_avg = None
+                    if "weight" in param_name:
+                        print(f"resetting {param_name} with coef {reset_coef}")
+                        reset_weights(param, reset_coef, exp_avg)
+                    if "bias" in param_name:
+                        print(f"resetting {param_name} with coef {reset_coef}")
+                        bound = BIAS_BOUND_DICT[param_name]
+                        if not args.no_reset_bias:
+                            reset_bias(param, bound, reset_coef, exp_avg)
 
-                if "expavg" in args.reset_type:
-                    exp_avg = state["exp_avg"]
-
-                reset_coef = RESET_COEF_DICT["actor"][layer_name]
-                # reset_coef = 1
-                if "weight" in param_name:
-                    print(f"resetting {param_name} with coef {reset_coef}")
-                    reset_weights(param, reset_coef, exp_avg)
-                if "bias" in param_name:
-                    print(f"resetting {param_name} with coef {reset_coef}")
-                    print(actor.bias_bounds)
-                    bound = actor.bias_bounds[layer_name]
-                    if not args.no_reset_bias:
-                        reset_bias(param, bound, reset_coef, exp_avg)
+            reset(actor_optimizer)
+            reset(q_optimizer)
 
         if global_step <= args.learning_starts:
             continue

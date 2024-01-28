@@ -23,12 +23,14 @@ from torch.utils.tensorboard import SummaryWriter
 
 """
 all params:
+
 critic.0.weight 1 torch.Size([64, 376])
 critic.0.bias 1 torch.Size([64])
 critic.2.weight 1 torch.Size([64, 64])
 critic.2.bias 1 torch.Size([64])
 critic.4.weight 1 torch.Size([1, 64])
 critic.4.bias 1 torch.Size([1])
+
 actor_mean.0.weight 1 torch.Size([64, 376])
 actor_mean.0.bias 1 torch.Size([64])
 actor_mean.2.weight 1 torch.Size([64, 64])
@@ -38,25 +40,30 @@ actor_mean.4.bias 1 torch.Size([17])
 actor_logstd 1 torch.Size([1, 17])
 """
 
-# can't put it in args
-
 RESET_COEF_DICT = {
-    "critic": {"0": 0.25, "2": 0.5, "4": 1},
-    "actor": {"0": 0.1, "2": 0.25, "4": 0.5, "actor_logstd": 0.0},
+    "critic.0": 0.25,
+    "critic.2": 0.5,
+    "critic.4": 1,
+    "actor_mean.0": 0.25,
+    "actor_mean.2": 0.5,
+    "actor_mean.4": 1,
+    "actor_logstd": 1,
 }
 
-"""
-RESET_COEF_DICT = {
-    "critic": {"0": 0.5, "2": 0.5, "4": 1},
-    "actor": {"0": 0.0, "2": 0.0, "4": 0.5, "actor_logstd": 0.5},
-}
-"""
+RESET_COEF_DICT_TMP = {}
+for k, v in RESET_COEF_DICT.items():
+    if "_logstd" in k:
+        RESET_COEF_DICT_TMP[k] = v
+        continue
+    RESET_COEF_DICT_TMP[f"{k}.bias"] = v
+    RESET_COEF_DICT_TMP[f"{k}.weight"] = v
+RESET_COEF_DICT = RESET_COEF_DICT_TMP
+print(RESET_COEF_DICT)
 
 
 @dataclass
 class Args:
-    n_reset_steps: int = 200000
-    # reset_steps: int = 5000
+    n_reset_steps: int = 1000
     reset_type: str = "full"
     reset_module: Tuple[str, ...] = ("critic",)
     no_reset_bias: int = 0
@@ -98,7 +105,8 @@ class Args:
     """the learning rate of the optimizer"""
     num_envs: int = 1
     """the number of parallel game environments"""
-    num_steps: int = 2048
+    # num_steps: int = 2048
+    num_steps: int = 256
     """the number of steps to run in each environment per policy rollout"""
     anneal_lr: bool = True
     """Toggle learning rate annealing for policy and value networks"""
@@ -212,28 +220,11 @@ def reset_by_val(param, rand_part, reset_coef, mask=None):
     data_flatten[last_idxs] = rand_part.flatten()[last_idxs]
 
 
-def reset_weights(param, std_coef, reset_coef, exp_avg=None):
+def reset_param(param, rand_part, reset_coef, exp_avg=None):
+    print(f"performing {args.reset_type} reset on {param_name} with coef {reset_coef}")
     with torch.no_grad():
-        param_copy = param.data.clone()
-        rand_part = torch.nn.init.orthogonal_(param_copy, std_coef)
-        print(args.reset_type)
         if args.reset_type == "full":
-            print(f"performing full reset with coef {reset_coef}")
             param.data = reset_coef * rand_part + (1 - reset_coef) * param.data
-        if "wnorm_abs" in args.reset_type:
-            print("using abs for resets")
-            reset_by_abs(param, rand_part, reset_coef, exp_avg)
-        if "wnorm_val" in args.reset_type:
-            print("NOT using abs for resets")
-            reset_by_val(param, rand_part, reset_coef, exp_avg)
-
-
-def reset_bias(param, reset_coef, exp_avg=None):
-    with torch.no_grad():
-        rand_part = torch.zeros(param.data.shape, device=param.device)
-        if args.reset_type == "full":
-            # rand_part = bias_const = 0
-            param.data = reset_coef * 0 + (1 - reset_coef) * param.data
         if "wnorm_abs" in args.reset_type:
             reset_by_abs(param, rand_part, reset_coef, exp_avg)
         if "wnorm_val" in args.reset_type:
@@ -339,9 +330,11 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
+
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, i, args.capture_video, run_name, args.gamma) for i in range(args.num_envs)]
     )
+
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
@@ -545,24 +538,19 @@ if __name__ == "__main__":
                         if "expavg" in args.reset_type:
                             exp_avg = state["exp_avg"]
 
-                        for reset_module in args.reset_module:
-                            if param_name == "actor_logstd":
-                                reset_coef = RESET_COEF_DICT["actor"][param_name]
-                            else:
-                                layer_idx = param_name.split(".")[-2]
-                                reset_coef = RESET_COEF_DICT[reset_module][layer_idx]
+                        if all(m not in param_name for m in args.reset_module):
+                            continue
 
-                            if reset_module in param_name and "weight" in param_name:
-                                print(f"resetting {param_name} with coef {reset_coef}")
-                                std_coef = agent.weight_stds.get(param_name, agent.default_std)
-                                reset_weights(param, std_coef, reset_coef, exp_avg)
-                            if reset_module in param_name and "bias" in param_name:
-                                print(f"resetting {param_name} with coef {reset_coef}")
-                                if not args.no_reset_bias:
-                                    reset_bias(param, reset_coef, exp_avg)
-                            if reset_module == "actor" and "logstd" in param_name:
-                                print(f"resetting {param_name} with coef {reset_coef}")
-                                reset_bias(param, reset_coef, exp_avg)
+                        reset_coef = RESET_COEF_DICT[param_name]
+
+                        if "weight" in param_name:
+                            std_coef = agent.weight_stds.get(param_name, agent.default_std)
+                            param_copy = param.data.clone()
+                            rand_part = torch.nn.init.orthogonal_(param_copy, std_coef)
+                        if "bias" in param_name or "logstd" in param_name:
+                            rand_part = torch.zeros(param.data.shape, device=param.device)
+
+                        reset_param(param, rand_part, reset_coef, exp_avg)
 
             if args.target_kl is not None and approx_kl > args.target_kl:
                 break
